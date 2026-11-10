@@ -1,0 +1,164 @@
+#!/bin/bash
+
+# --- Функция вывода справки ---
+show_usage() {
+    cat << EOF
+Использование: $(basename "$0") <количество_видео_в_пачке>
+   или: $(basename "$0") -h | --help
+
+Описание:
+Скрипт находит все MP4-файлы в текущей директории, сортирует их по номерам
+и разбивает на группы (пачки) по заданному количеству.
+Затем каждая группа склеивается в один файл с помощью ffmpeg (без перекодирования).
+Готовые файлы сохраняются в директорию 'result'.
+
+Аргументы:
+  <количество_видео_в_пачке>  Целое число > 0, или -1.
+                              Определяет, сколько исходных видео будут
+                              объединены в один выходной файл.
+                              -1 — склеить все видео в один файл.
+
+Примеры:
+  $(basename "$0") 5
+  Если в папке 12 видео, скрипт создаст 3 файла:
+  - 001_005.mp4 (склеит первые 5)
+  - 006_010.mp4 (склеит следующие 5)
+  - 011_012.mp4 (склеит оставшиеся 2)
+
+  $(basename "$0") -1
+  Склеит все видео в текущей директории в один файл.
+
+Требования:
+  - Установленный ffmpeg.
+  - Имена файлов должны начинаться с чисел для корректной сортировки.
+EOF
+}
+
+# --- Обработка аргументов ---
+if [[ "$1" == "-h" || "$1" == "--help" ]]; then
+    show_usage
+    exit 0
+fi
+
+if [[ -z "$1" ]]; then
+    echo "Ошибка: не указан обязательный аргумент."
+    echo ""
+    show_usage
+    exit 1
+fi
+
+if ! [[ "$1" =~ ^-1$|^[1-9][0-9]*$ ]]; then
+    echo "Ошибка: аргумент должен быть целым числом больше нуля, или -1."
+    echo ""
+    show_usage
+    exit 1
+fi
+
+# --- Проверка зависимостей ---
+if ! command -v ffmpeg >/dev/null 2>&1; then
+    echo "Ошибка: ffmpeg не найден. Установите его и попробуйте снова."
+    exit 1
+fi
+
+bunch_len_arg="$1"
+tmp_dir="concat-videos-tmp"
+result_dir_name="result"
+
+# Очистка временной папки при выходе (успешном или с ошибкой)
+trap 'rm -rf "$tmp_dir"' EXIT
+
+mkdir -p "$tmp_dir"
+mkdir -p "$result_dir_name"
+
+# Включаем nullglob, чтобы цикл for не сработал, если mp4 файлов нет
+shopt -s nullglob
+mp4_files=(*.mp4)
+shopt -u nullglob
+
+if [[ ${#mp4_files[@]} -eq 0 ]]; then
+    echo "Ошибка: в текущей директории не найдено ни одного .mp4 файла."
+    exit 1
+fi
+
+if [[ "$bunch_len_arg" == "-1" ]]; then
+    bunch_len=${#mp4_files[@]}
+else
+    bunch_len="$bunch_len_arg"
+fi
+
+# Создаем список файлов с АБСОЛЮТНЫМИ путями
+list_file="$tmp_dir/mylist.txt"
+> "$list_file"
+for f in "${mp4_files[@]}"; do
+    # Используем realpath для получения абсолютного пути
+    echo "file '$(realpath "$f")'" >> "$list_file"
+done
+
+# Сортируем и сохраняем в промежуточный файл
+sorted_list="$tmp_dir/sorted_list.txt"
+sort -t "'" -n -k2 "$list_file" > "$sorted_list"
+
+# Разбиваем на части
+split -l "$bunch_len" "$sorted_list" "$tmp_dir/chunk_"
+
+# Проверяем, что split создал файлы
+if ! ls "$tmp_dir"/chunk_* 1> /dev/null 2>&1; then
+    echo "Ошибка: не удалось разбить список на части."
+    exit 1
+fi
+
+# --- Счётчики для отслеживания ошибок ---
+total=0
+success=0
+failed=0
+failed_names=()
+
+# Обработка частей
+k=1
+for j in "$tmp_dir"/chunk_*; do
+    # Считаем строк в текущем чанке
+    inc=$(wc -l < "$j")
+    
+    m=$(printf "%03d" "$k")
+    n=$(printf "%03d" "$((k + inc - 1))")
+    name="${m}_${n}.mp4"
+    output_path="$result_dir_name/$name"
+
+    total=$((total + 1))
+    echo "[$total] Склеиваю файлы с $m по $n -> $output_path ..."
+    
+    # Запускаем ffmpeg и сохраняем код возврата
+    if ffmpeg -y -loglevel error -stats -f concat -safe 0 -i "$j" -c copy "$output_path"; then
+        success=$((success + 1))
+    else
+        failed=$((failed + 1))
+        failed_names+=("$name")
+        # Удаляем неполный/битый файл, если он остался
+        if [[ -f "$output_path" ]]; then
+            rm -f "$output_path"
+            echo "   -> Удалён неполный файл: $output_path"
+        fi
+    fi
+
+    k=$((k + bunch_len))
+done
+
+# --- Итоговое сообщение с учётом ошибок ---
+echo ""
+echo "========================================="
+echo "Итого обработано пачек: $total"
+echo "Успешно склеено:        $success"
+echo "С ошибками:             $failed"
+echo "========================================="
+
+if [[ $failed -gt 0 ]]; then
+    echo ""
+    echo "Не удалось склеить следующие файлы:"
+    for fn in "${failed_names[@]}"; do
+        echo "  - $fn"
+    done
+    exit 1
+fi
+
+echo "Готово! Все результаты сохранены в папку '$result_dir_name'."
+exit 0

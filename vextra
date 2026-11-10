@@ -1,0 +1,182 @@
+#!/usr/bin/env python3
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+
+
+def probe_encoding(input_path):
+    """Extract video/audio encoding parameters from the input file."""
+    cmd = [
+        "ffprobe", "-v", "quiet", "-print_format", "json",
+        "-show_streams", input_path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        sys.exit(f"ffprobe error:\n{result.stderr}")
+
+    streams = json.loads(result.stdout).get("streams", [])
+
+    enc = {}
+    for s in streams:
+        if s.get("codec_type") == "video" and "v_codec" not in enc:
+            enc["v_codec"] = s.get("codec_name", "libx264")
+            if s.get("bit_rate"):
+                enc["v_bitrate"] = s["bit_rate"]
+            enc["v_pix_fmt"] = s.get("pix_fmt", "yuv420p")
+        elif s.get("codec_type") == "audio" and "a_codec" not in enc:
+            enc["a_codec"] = s.get("codec_name", "aac")
+            if s.get("bit_rate"):
+                enc["a_bitrate"] = s["bit_rate"]
+            if s.get("sample_rate"):
+                enc["a_sample_rate"] = s["sample_rate"]
+            if s.get("channels"):
+                enc["a_channels"] = str(s["channels"])
+
+    return enc
+
+
+def build_encode_args(enc):
+    """Build ffmpeg encoding arguments matching the source."""
+    codec_map = {"h264": "libx264", "hevc": "libx265", "vp9": "libvpx-vp9",
+                 "av1": "libaom-av1", "aac": "aac", "mp3": "libmp3lame",
+                 "opus": "libopus", "vorbis": "libvorbis", "flac": "flac"}
+
+    args = []
+    v_codec = enc.get("v_codec", "libx264")
+    args += ["-c:v", codec_map.get(v_codec, v_codec)]
+    if enc.get("v_bitrate"):
+        args += ["-b:v", enc["v_bitrate"]]
+    if enc.get("v_pix_fmt"):
+        args += ["-pix_fmt", enc["v_pix_fmt"]]
+
+    a_codec = enc.get("a_codec", "aac")
+    args += ["-c:a", codec_map.get(a_codec, a_codec)]
+    if enc.get("a_bitrate"):
+        args += ["-b:a", enc["a_bitrate"]]
+    if enc.get("a_sample_rate"):
+        args += ["-ar", enc["a_sample_rate"]]
+    if enc.get("a_channels"):
+        args += ["-ac", enc["a_channels"]]
+
+    return args
+
+
+def seconds_to_timestamp(s):
+    total = int(s)
+    hours = total // 3600
+    minutes = (total % 3600) // 60
+    secs = total % 60
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def normalize_timestamp(ts):
+    """Expand M:SS to HH:MM:SS and zero-pad all parts."""
+    parts = ts.split(":")
+    if len(parts) == 2:
+        return f"00:{int(parts[0]):02d}:{int(parts[1]):02d}"
+    if len(parts) == 3:
+        return f"{int(parts[0]):02d}:{int(parts[1]):02d}:{int(parts[2]):02d}"
+    return ts
+
+
+def parse_range(r):
+    idx = r.rfind("-")
+    if idx == -1:
+        sys.exit(f"Invalid range format: {r}")
+
+    start = r[:idx]
+    rest = r[idx + 1:]
+
+    if ":" in rest:
+        return normalize_timestamp(start), {"to": normalize_timestamp(rest)}
+    else:
+        return normalize_timestamp(start), {"t": seconds_to_timestamp(int(rest))}
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Extract and concatenate video segments",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+range formats:
+  START-END         both as timestamps, e.g. 00:01:00-00:02:30
+  START-SECONDS     timestamp start + duration in seconds, e.g. 00:01:00-90
+  SECONDS-SECONDS   both in seconds, e.g. 60-30 (start at 60s, extract 30s)
+
+  timestamps support short form: 1:30 = 00:01:30, 5:00 = 00:05:00
+
+examples:
+  %(prog)s -i video.mp4 -r "1:00-2:30" out.mp4
+      Extract from 00:01:00 to 00:02:30 (absolute end time)
+
+  %(prog)s -i video.mp4 -r "1:00-90" out.mp4
+      Extract 90 seconds starting from 00:01:00
+
+  %(prog)s -i video.mp4 -r "60-30" out.mp4
+      Start at 60s, extract 30 seconds
+
+  %(prog)s -i video.mp4 -r "1:00-2:30, 5:00-120, 10:00-11:00" out.mp4
+      Extract and concatenate multiple segments
+""",
+    )
+    parser.add_argument("-i", required=True, metavar="INPUT", help="Input video path")
+    parser.add_argument(
+        "-r", required=True, metavar="RANGES",
+        help="Comma-separated ranges: START-END or START-SECONDS "
+             "(e.g. 00:01:00-00:02:30, 00:01:00-90)",
+    )
+    parser.add_argument("output", help="Output video path")
+    args = parser.parse_args()
+
+    input_path = os.path.abspath(args.i)
+    output_path = os.path.abspath(args.output)
+    ranges = [parse_range(r.strip()) for r in args.r.split(",")]
+
+    print("Probing source encoding...")
+    enc = probe_encoding(input_path)
+    encode_args = build_encode_args(enc)
+    print(f"  Video: {enc.get('v_codec')} @ {enc.get('v_bitrate', 'default')} bps")
+    print(f"  Audio: {enc.get('a_codec')} @ {enc.get('a_bitrate', 'default')} bps")
+
+    tmpdir = tempfile.mkdtemp(prefix="vextra_")
+    try:
+        segments = []
+        for i, (start, end_spec) in enumerate(ranges):
+            seg_path = os.path.join(tmpdir, f"seg_{i:04d}.ts")
+            cmd = ["ffmpeg", "-y", "-ss", start]
+            if "to" in end_spec:
+                cmd += ["-to", end_spec["to"]]
+            else:
+                cmd += ["-t", end_spec["t"]]
+            cmd += ["-i", input_path] + encode_args + ["-avoid_negative_ts", "1", seg_path]
+
+            print(f"[{i+1}/{len(ranges)}] Extracting {start} -> {end_spec}")
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                sys.exit(f"ffmpeg error:\n{result.stderr}")
+            segments.append(seg_path)
+
+        concat_file = os.path.join(tmpdir, "concat.txt")
+        with open(concat_file, "w") as f:
+            for seg in segments:
+                f.write(f"file '{seg}'\n")
+
+        print("Concatenating segments...")
+        cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0",
+               "-i", concat_file, "-c", "copy", output_path]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            sys.exit(f"ffmpeg error:\n{result.stderr}")
+
+        print(f"Done: {output_path}")
+    finally:
+        shutil.rmtree(tmpdir)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,89 @@
+#!/usr/bin/env python3
+import sys
+import shutil
+from pathlib import Path
+
+
+def filter_dataset(input_path: str, exclude_classes: set):
+    src_dir = Path(input_path).resolve()
+    if not src_dir.is_dir():
+        print(f"Error: '{input_path}' is not a directory.")
+        sys.exit(1)
+
+    class_str = "_".join(str(c) for c in sorted(exclude_classes))
+    dst_dir = src_dir.parent / f"{src_dir.name}_no_class{class_str}"
+    dst_dir.mkdir(exist_ok=True)
+
+    images_dir = src_dir / "images"
+    labels_dir = src_dir / "labels"
+
+    if not images_dir.is_dir() or not labels_dir.is_dir():
+        print("Error: dataset must contain 'images' and 'labels' folders.")
+        sys.exit(1)
+
+    splits = sorted([d.name for d in images_dir.iterdir() if d.is_dir()])
+    if not splits:
+        print("Error: no split folders found in 'images/'.")
+        sys.exit(1)
+
+    print(f"Found splits: {splits}\n")
+
+    for split in splits:
+        print(f"Processing split: '{split}'")
+        src_img_split = images_dir / split
+        src_lbl_split = labels_dir / split
+        dst_img_split = dst_dir / "images" / split
+        dst_lbl_split = dst_dir / "labels" / split
+
+        if not src_lbl_split.is_dir():
+            print(f"  Skipping: no '{split}' folder in 'labels/'.\n")
+            continue
+
+        dst_img_split.mkdir(parents=True, exist_ok=True)
+        dst_lbl_split.mkdir(parents=True, exist_ok=True)
+
+        copied_count = 0
+        for txt_path in src_lbl_split.glob("*.txt"):
+            try:
+                with open(txt_path, "r", encoding="utf-8") as f:
+                    lines = [l for l in f.readlines() if l.strip()]
+
+                filtered = [l for l in lines if int(l.split()[0]) not in exclude_classes]
+
+                with open(dst_lbl_split / txt_path.name, "w", encoding="utf-8") as f:
+                    f.writelines(filtered)
+
+                for file in src_img_split.iterdir():
+                    if file.is_file() and file.stem == txt_path.stem:
+                        shutil.copy2(file, dst_img_split / file.name)
+                        copied_count += 1
+
+            except Exception as e:
+                print(f"  Warning: error reading {txt_path.name}: {e}")
+
+        print(f"  Copied {copied_count} files.\n")
+
+    print(f"Done! New dataset: {dst_dir}")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) != 3:
+        print("Usage: filter_class '<class_ids>' <dataset_path>")
+        print("  <class_ids>    comma- or space-separated class IDs to remove (e.g. '0,1,2' or '0 1 2')")
+        print("  <dataset_path> path to YOLO dataset with images/ and labels/ folders")
+        print()
+        print("Behavior:")
+        print("  - Removes all annotation lines matching the specified class IDs")
+        print("  - Images are always copied, even if their annotation becomes empty")
+        print("  - Output is saved to <dataset_path>_no_class<ids> next to the source folder")
+        print()
+        print("Example: filter_class 0,1 /data/my_dataset")
+        sys.exit(1)
+
+    try:
+        exclude_classes = set(int(c) for c in sys.argv[1].replace(",", " ").split())
+    except ValueError:
+        print("Error: class IDs must be integers.")
+        sys.exit(1)
+
+    filter_dataset(sys.argv[2], exclude_classes)

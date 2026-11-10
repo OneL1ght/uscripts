@@ -1,0 +1,8 @@
+#!/bin/bash
+
+if [ $# -ne 2 ]; then
+    echo "Usage: vgetn <video_file> <frame_number>" >&2
+    exit 1
+fi
+
+ffmpeg -i "$1" -vf "select=eq(n\,$2)" -vframes 1 "$2.png" -y

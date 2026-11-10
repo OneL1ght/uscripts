@@ -1,0 +1,218 @@
+#!/usr/bin/env python3
+import os
+import sys
+import argparse
+from collections import defaultdict, Counter
+
+# Поддерживаемые форматы изображений
+IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.bmp', '.gif', '.webp', '.tif', '.tiff'}
+
+def get_image_size(filepath):
+    """Возвращает (width, height) из заголовка изображения без сторонних библиотек."""
+    try:
+        with open(filepath, 'rb') as f:
+            header = f.read(32)
+            if len(header) < 8:
+                return None, None
+
+            # PNG
+            if header[:8] == b'\x89PNG\r\n\x1a\n':
+                w = int.from_bytes(header[16:20], 'big')
+                h = int.from_bytes(header[20:24], 'big')
+                return w, h
+            # GIF
+            elif header[:6] in (b'GIF87a', b'GIF89a'):
+                w = int.from_bytes(header[6:8], 'little')
+                h = int.from_bytes(header[8:10], 'little')
+                return w, h
+            # BMP
+            elif header[:2] == b'BM':
+                w = int.from_bytes(header[18:22], 'little')
+                h = int.from_bytes(header[22:26], 'little')
+                return w, h
+            # JPEG
+            elif header[:2] == b'\xff\xd8':
+                f.seek(0)
+                data = f.read(65536)  # SOF-маркеры обычно в первых 64KB
+                pos = 2
+                while pos < len(data) - 9:
+                    if data[pos] == 0xFF and 0xC0 <= data[pos+1] <= 0xC3:
+                        h = int.from_bytes(data[pos+5:pos+7], 'big')
+                        w = int.from_bytes(data[pos+7:pos+9], 'big')
+                        return w, h
+                    pos += 1
+                return None, None
+            # WEBP / TIFF и другие форматы требуют сложных парсеров
+            # В рамках стандартной библиотеки возвращаем None
+            return None, None
+    except Exception:
+        return None, None
+
+def detect_split(filepath):
+    """Определяет подвыборку по пути (train, val, test, other)."""
+    parts = os.path.normpath(filepath).split(os.sep)
+    for p in parts:
+        p_lower = p.lower()
+        if 'train' in p_lower: return 'train'
+        if p_lower in ('val', 'valid', 'validation'): return 'val'
+        if 'test' in p_lower: return 'test'
+    return 'other'
+
+def format_num(n):
+    """Форматирует число с разделителями тысяч."""
+    return f"{n:,}".replace(",", " ")
+
+def analyze_dataset(dataset_dir):
+    """Собирает статистику по датасету."""
+    # Хранилища
+    images = {}  # stem -> {'path', 'split', 'ext', 'size'}
+    annotations = {}  # stem -> path
+    stats = {
+        'total_images': 0,
+        'matched_annotations': 0,
+        'missing_annotations': 0,
+        'unknown_sizes': 0,
+        'splits': Counter(),
+        'sizes': Counter(),
+        'formats': Counter(),
+        'classes_total': Counter(),
+        'classes_per_split': defaultdict(Counter)
+    }
+
+    print("🔍 Шаг 1: Сканирование изображений...")
+    for root, _, files in os.walk(dataset_dir):
+        for fname in files:
+            if fname.startswith('.'): continue
+            ext = os.path.splitext(fname)[1].lower()
+            if ext in IMAGE_EXTS:
+                fpath = os.path.join(root, fname)
+                stem = os.path.splitext(fname)[0]
+                images[stem] = {
+                    'path': fpath,
+                    'split': detect_split(fpath),
+                    'ext': ext,
+                    'size': get_image_size(fpath)
+                }
+
+    print(f"🖼️  Найдено изображений: {format_num(len(images))}")
+    print("📝 Шаг 2: Сканирование аннотаций и подсчёт классов...")
+
+    for root, _, files in os.walk(dataset_dir):
+        for fname in files:
+            if fname.startswith('.') or not fname.lower().endswith('.txt'): continue
+            fpath = os.path.join(root, fname)
+            stem = os.path.splitext(fname)[0]
+            
+            if stem in images:
+                stats['matched_annotations'] += 1
+                split = images[stem]['split']
+                try:
+                    with open(fpath, 'r', encoding='utf-8') as f:
+                        for line in f:
+                            line = line.strip()
+                            if not line: continue
+                            parts = line.split()
+                            if not parts: continue
+                            try:
+                                cls_id = int(parts[0])
+                                stats['classes_total'][cls_id] += 1
+                                stats['classes_per_split'][split][cls_id] += 1
+                            except ValueError:
+                                continue
+                except Exception:
+                    continue
+            else:
+                stats['missing_annotations'] += 1
+
+    # Заполняем итоговую статистику
+    stats['total_images'] = len(images)
+    for stem, info in images.items():
+        stats['splits'][info['split']] += 1
+        stats['formats'][info['ext']] += 1
+        w, h = info['size']
+        if w and h:
+            stats['sizes'][(w, h)] += 1
+        else:
+            stats['unknown_sizes'] += 1
+
+    print(f"✅ Анализ завершён.")
+    return stats
+
+def build_report(stats, total_instances=None):
+    """Формирует текстовый отчёт."""
+    lines = []
+    lines.append("=" * 60)
+    lines.append("             STATISTICS OF ULTRALYTICS DATASET")
+    lines.append("=" * 60)
+    
+    total_imgs = stats['total_images']
+    lines.append(f"\n📊 OVERVIEW:")
+    lines.append(f"  Total Images:          {format_num(total_imgs)}")
+    lines.append(f"  Matched Annotations:   {format_num(stats['matched_annotations'])}")
+    lines.append(f"  Missing Annotations:   {format_num(stats['missing_annotations'])}")
+    lines.append(f"  Unknown Sizes:         {format_num(stats['unknown_sizes'])}")
+
+    lines.append(f"\n📂 SPLITS:")
+    for split in ['train', 'val', 'test', 'other']:
+        count = stats['splits'].get(split, 0)
+        if count > 0:
+            pct = (count / total_imgs * 100) if total_imgs else 0
+            lines.append(f"  {split:<10}: {format_num(count):>8} ({pct:5.1f}%)")
+
+    lines.append(f"\n🖼️  IMAGE FORMATS:")
+    total_fmts = sum(stats['formats'].values())
+    for fmt, count in sorted(stats['formats'].items(), key=lambda x: x[1], reverse=True):
+        pct = (count / total_fmts * 100) if total_fmts else 0
+        lines.append(f"  {fmt:<8}: {format_num(count):>8} ({pct:5.1f}%)")
+
+    lines.append(f"\n📐 IMAGE SIZES (Top 15):")
+    total_sizes = sum(stats['sizes'].values())
+    for (w, h), count in stats['sizes'].most_common(15):
+        pct = (count / total_sizes * 100) if total_sizes else 0
+        lines.append(f"  {w}x{h:<15}: {format_num(count):>8} ({pct:5.1f}%)")
+
+    # Статистика классов
+    if total_instances is not None and total_instances > 0:
+        lines.append(f"\n🏷️  CLASS DISTRIBUTION (Total Instances: {format_num(total_instances)}):")
+        lines.append(f"  {'Class':<8} | {'Total':>8} | {'Train':>8} | {'Val':>8} | {'Test':>8} | {'Other':>8}")
+        lines.append(f"  {'-'*8}-+-{'-'*8}-+-{'-'*8}-+-{'-'*8}-+-{'-'*8}-+-{'-'*8}")
+        for cls_id in sorted(stats['classes_total'].keys()):
+            total_c = stats['classes_total'][cls_id]
+            train_c = stats['classes_per_split']['train'].get(cls_id, 0)
+            val_c   = stats['classes_per_split']['val'].get(cls_id, 0)
+            test_c  = stats['classes_per_split']['test'].get(cls_id, 0)
+            other_c = stats['classes_per_split']['other'].get(cls_id, 0)
+            lines.append(f"  {cls_id:<8} | {format_num(total_c):>8} | {format_num(train_c):>8} | {format_num(val_c):>8} | {format_num(test_c):>8} | {format_num(other_c):>8}")
+    else:
+        lines.append(f"\n🏷️  CLASSES: No valid class instances found.")
+
+    lines.append("\n" + "=" * 60)
+    return "\n".join(lines)
+
+def main():
+    parser = argparse.ArgumentParser(description="Генерация статистики датасета Ultralytics (без сторонних библиотек)")
+    parser.add_argument("dataset_dir", help="Путь к корневой директории датасета")
+    parser.add_argument("-o", "--output", default="dataset_stats.txt", help="Файл для сохранения отчёта")
+    args = parser.parse_args()
+
+    if not os.path.isdir(args.dataset_dir):
+        print(f"❌ Ошибка: Директория '{args.dataset_dir}' не найдена.")
+        sys.exit(1)
+
+    stats = analyze_dataset(args.dataset_dir)
+    total_instances = sum(stats['classes_total'].values())
+    report = build_report(stats, total_instances)
+
+    # Вывод в консоль
+    print("\n" + report)
+
+    # Сохранение в файл
+    try:
+        with open(args.output, 'w', encoding='utf-8') as f:
+            f.write(report)
+        print(f"\n💾 Отчёт сохранён в: {os.path.abspath(args.output)}")
+    except Exception as e:
+        print(f"\n⚠️  Не удалось сохранить отчёт: {e}")
+
+if __name__ == "__main__":
+    main()

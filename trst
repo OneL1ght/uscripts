@@ -1,0 +1,95 @@
+#!/usr/bin/env python3
+import argparse
+import shutil
+import random
+from pathlib import Path
+from collections import defaultdict
+
+def safe_transfer(src: Path, dest_dir: Path, move: bool = False) -> Path:
+    """Copies or moves a file, automatically handling name conflicts in the destination directory."""
+    dest = dest_dir / src.name
+    if not dest.exists():
+        if move:
+            shutil.move(src, dest)
+        else:
+            shutil.copy2(src, dest)
+        return dest
+
+    # If a file with the same name already exists, append a suffix: _1, _2, etc.
+    stem, suffix = src.stem, src.suffix
+    counter = 1
+    while True:
+        dest = dest_dir / f"{stem}_{counter}{suffix}"
+        if not dest.exists():
+            if move:
+                shutil.move(src, dest)
+            else:
+                shutil.copy2(src, dest)
+            return dest
+        counter += 1
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="TRansport by STems\n\nCopies or moves files with matching stems from specified directories to a single output directory.",
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument('-i', '--input', nargs='+', required=True,
+                        help='Path(s) to the source directory(ies)')
+    parser.add_argument('-o', '--output', required=True,
+                        help='Path to the destination directory')
+    parser.add_argument('-p', '--pairs-only', action='store_true',
+                        help='Process only files that have at least one matching stem pair')
+    parser.add_argument('-s', '--shuffle', action='store_true',
+                        help='Shuffle stem groups before selection')
+    parser.add_argument('-n', type=int, default=None,
+                        help='Maximum number of stem groups to process (default: all groups)')
+    parser.add_argument('-m', '--move', action='store_true',
+                        help='Move files instead of copying them')
+
+    args = parser.parse_args()
+
+    if args.n is not None and args.n <= 0:
+        parser.error("The -n flag must specify a positive integer.")
+    input_dirs = []
+    for p in args.input:
+        path = Path(p).resolve()
+        if not path.is_dir():
+            parser.error(f"Input directory '{path}' does not exist or is not a directory.")
+        input_dirs.append(path)
+
+    output_dir = Path(args.output).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stem_groups = defaultdict(list)
+    for d in input_dirs:
+        try:
+            # Note: iterdir() is non-recursive. Use d.rglob('*') for recursive search.
+            for f in d.iterdir():
+                if f.is_file():
+                    stem_groups[f.stem].append(f)
+        except PermissionError:
+            print("⚠️ Permission denied in one or more input directories.")
+            continue
+    if args.pairs_only:
+        stem_groups = {k: v for k, v in stem_groups.items() if len(v) >= 2}
+    groups = list(stem_groups.items())
+    if args.shuffle:
+        random.shuffle(groups)
+    if args.n is not None:
+        groups = groups[:args.n]
+    files_to_process = [f for _, group in groups for f in group]
+
+    if not files_to_process:
+        print("⚠️ No files found matching the specified criteria.")
+        return
+
+    action = "moved" if args.move else "copied"
+    print(f"📂 Selected {len(groups)} stem group(s), totaling {len(files_to_process)} files.")
+
+    for f in files_to_process:
+        dest = safe_transfer(f, output_dir, move=args.move)
+        print(f"✅ {action.capitalize()} {f.name} -> {dest.name}")
+
+    print(f"🎉 Done! All {len(groups)} stem groups {action} to {output_dir}")
+
+if __name__ == '__main__':
+    main()
